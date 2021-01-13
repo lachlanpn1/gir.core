@@ -12,8 +12,9 @@ namespace GObject
     {
         #region Fields
 
-        private static readonly Dictionary<IntPtr, Object> Objects = new Dictionary<IntPtr, Object>();
-        private static readonly Dictionary<ClosureHelper, ulong> Closures = new Dictionary<ClosureHelper, ulong>();
+        private static readonly Dictionary<IntPtr, ToggleRef<Object>> SubclassObjects = new ();
+        private static readonly Dictionary<IntPtr, WeakReference<Object>> WrapperObjects = new ();
+        private static readonly Dictionary<ClosureHelper, ulong> Closures = new ();
 
         #endregion
 
@@ -125,17 +126,16 @@ namespace GObject
         private void Initialize(IntPtr ptr)
         {
             Handle = ptr;
-            //TODO
-            Objects.Add(ptr, this);
+
+            RegisterObject();
             RegisterProperties();
             RegisterOnFinalized();
 
-            // Allow subclasses to perform initialization
             Initialize();
         }
 
         /// <summary>
-        ///  Wrappers can override here to perform immediate initialization
+        /// Wrapper and subclasses can override here to perform immediate initialization
         /// </summary>
         protected virtual void Initialize() { }
 
@@ -152,6 +152,14 @@ namespace GObject
             Native.weak_ref(Handle, _onFinalized, IntPtr.Zero);
         }
 
+        private void RegisterObject()
+        {
+            if(IsSubclass(GetType()))
+                SubclassObjects.Add(Handle, this);
+            else
+                WrapperObjects.Add(Handle, new WeakReference<Object>(this));
+        }
+        
         private void RegisterProperties()
         {
             const System.Reflection.BindingFlags PropertyDescriptorFieldFlags = System.Reflection.BindingFlags.Public
@@ -245,18 +253,6 @@ namespace GObject
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
 
-        protected internal static bool GetObject<T>(IntPtr handle, out T obj) where T : Object
-        {
-            if (Objects.TryGetValue(handle, out Object? foundObj))
-            {
-                obj = (T) foundObj;
-                return true;
-            }
-
-            obj = default!;
-            return false;
-        }
-
         /// <summary>
         /// This function returns the proxy object to the provided handle
         /// if it already exists, otherwise creates a new wrapper object
@@ -277,13 +273,13 @@ namespace GObject
                 throw new NullReferenceException(
                     $"Failed to wrap handle as type <{typeof(T).FullName}>. Null handle passed to WrapHandle.");
 
-            // Attempt to lookup the pointer in the object dictionary
-            if (Objects.TryGetValue(handle, out Object? obj))
-                return (T) (object) obj;
+            if (WrapperObjects.TryGetValue(handle, out WeakReference<Object>? weakReference))
+            {
+                if (weakReference.TryGetTarget(out Object? obj))
+                    return (T) obj;
 
-            // If it is not found, we can assume that it is NOT a subclass type,
-            // as we ensure that subclass types always outlive their pointers
-            // TODO: Toggle Refs ^^^
+                WrapperObjects.Remove(handle);
+            }
 
             // Resolve GType of object
             Type trueGType = TypeFromHandle(handle);
@@ -315,11 +311,6 @@ namespace GObject
                 if (!Global.Native.type_is_a(trueGType.Value, castGType.Value))
                     throw new InvalidCastException();
             }
-
-            // Ensure we are not constructing a subclass
-            // TODO: This can be removed once ToggleRefs are implemented
-            if (IsSubclass(trueType))
-                throw new Exception("Encountered foreign subclass pointer! This is a fatal error");
 
             // Create using 'IntPtr' constructor
             System.Reflection.ConstructorInfo? ctor = trueType.GetConstructor(
@@ -388,7 +379,7 @@ namespace GObject
         protected virtual void DisposeManagedState()
         {
             Handle = IntPtr.Zero;
-            Objects.Remove(Handle);
+            WrapperObjects.Remove(Handle);
             
             // TODO: Find out about closure release
             /*foreach(var closure in closures)
